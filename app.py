@@ -9,35 +9,46 @@ st.set_page_config(page_title="Online Course Recommender", layout="wide")
 # ----------------------------
 import pickle
 import pandas as pd
+import gdown
+import os
+
+# ----------------------------
+# Helper: Download + Load pickle
+# ----------------------------
+@st.cache_resource
+def load_pickle(file_id, filename):
+    url = f"https://drive.google.com/uc?id={file_id}"
+
+    if not os.path.exists(filename):
+        gdown.download(url, filename, quiet=False)
+
+    with open(filename, "rb") as f:
+        return pickle.load(f)
 
 # ----------------------------
 # Load Data
 # ----------------------------
-@st.cache_data
+@st.cache_resource
 def load_data():
-    df = pickle.load(open('data.pkl', 'rb'))
-    course_sim = pickle.load(open('course_sim.pkl', 'rb'))
-    item_sim = pickle.load(open('item_sim.pkl', 'rb'))
-    user_item = pickle.load(open('user_item.pkl', 'rb'))
+    df = load_pickle("1enXm6lGEYBRIv8tXpcnmrTYjUDtYwjgY", "data.pkl")
+    course_sim = load_pickle("1c7y7WoNfyZ4OCTLMJ3RT8GdIc8tSi5E8", "course_sim.pkl")
+    item_sim = load_pickle("14--VTq7owuE1a6QwK26_xJs2fuDZnyA9", "item_sim.pkl")
+    user_item = load_pickle("1Lm_tPczxvysZs2pu64vHaZ6eKLwEk9F7", "user_item.pkl")
+
     return df, course_sim, item_sim, user_item
 
-df, course_sim_df, item_sim_df, user_item_matrix = load_data()
+# ----------------------------
+# Load once
+# ----------------------------
+with st.spinner("🔄 Loading data (first time only)..."):
+    df, course_sim_df, item_sim_df, user_item_matrix = load_data()
+
+# Convert index to int list (fixes matching issue)
+valid_user_ids = set(map(int, user_item_matrix.index.tolist()))
 
 # ----------------------------
 # Recommendation Functions
 # ----------------------------
-def content_based_recommendations(course_id, n=5):
-    if course_id not in course_sim_df.columns:
-        return pd.DataFrame()
-
-    sim_scores = course_sim_df[course_id].sort_values(ascending=False)
-    top_courses = sim_scores.iloc[1:n+1].index
-
-    return df[df['course_id'].isin(top_courses)][
-        ['course_id', 'course_name', 'instructor', 'rating']
-    ].drop_duplicates()
-
-
 def get_popular_courses(n=5):
     popular = df.groupby(['course_id', 'course_name', 'instructor']).agg({
         'enrollment_numbers': 'sum',
@@ -56,65 +67,58 @@ def get_popular_courses(n=5):
 
 def hybrid_recommendations(user_id, n=5):
 
-    # 🆕 Case 1: New user
-    if user_id not in user_item_matrix.index:
-        st.info("🆕 New user detected → Showing popular courses")
+    # ❌ New user → Popular
+    if int(user_id) not in valid_user_ids:
+        st.warning("⚠️ User not found → Using Popular Recommendation System")
         return get_popular_courses(n)
+
+    # ✅ Existing user → Hybrid
+    st.success("✅ Existing user detected → Using Hybrid Recommendation System")
 
     user_ratings = user_item_matrix.loc[user_id]
-    rated_courses = user_ratings[user_ratings > 0].index.tolist()
+    rated_courses = user_ratings[user_ratings > 0]
 
-    # 😶 Case 2: Existing user but no ratings
-    if len(rated_courses) == 0:
-        st.info("📊 No history found → Showing popular courses")
+    if rated_courses.empty:
+        st.info("📊 No history → Showing popular courses")
         return get_popular_courses(n)
 
-    # 🤖 Case 3: Hybrid recommendations
-    recs = []
+    scores = {}
 
-    for course in rated_courses:
-        if course in course_sim_df.columns:
-            recs.append(content_based_recommendations(course, n))
+    for course, rating in rated_courses.items():
+        if course in item_sim_df.columns:
+            similar_items = item_sim_df[course]
 
-    if recs:
-        recs = pd.concat(recs).drop_duplicates()
+            for sim_course, sim_score in similar_items.items():
+                if sim_course not in rated_courses.index:
+                    scores[sim_course] = scores.get(sim_course, 0) + sim_score * rating
 
-        # Remove already seen courses
-        recs = recs[
-            ~recs['course_id'].isin(rated_courses)
-        ]
+    if not scores:
+        return get_popular_courses(n)
 
-        recs = recs.sort_values(by='rating', ascending=False)
+    rec_df = pd.DataFrame(scores.items(), columns=["course_id", "score"])
+    rec_df = rec_df.merge(df, on="course_id")
+    rec_df = rec_df.sort_values(by="score", ascending=False)
 
-        st.success("🤖 Personalized recommendations ready!")
-        return recs.head(n)
-
-    # fallback
-    return get_popular_courses(n)
-
+    return rec_df[['course_id', 'course_name', 'instructor', 'rating']].drop_duplicates().head(n)
 
 # ----------------------------
 # UI DESIGN
 # ----------------------------
-
-# Header
 st.title("🎓 Online Course Recommender")
 st.markdown("### 🚀 Hybrid ML-based Personalized Recommendations")
 
 # Sidebar
 st.sidebar.header("🔧 Controls")
 
-# 👉 Number input instead of dropdown
-user_id = st.sidebar.number_input(
-    "Enter User ID",
-    min_value=int(user_item_matrix.index.min()),
-    max_value=int(user_item_matrix.index.max()),
-    value=int(user_item_matrix.index.min()),
-    step=1
-)
+min_id = int(min(valid_user_ids))
+max_id = int(max(valid_user_ids))
 
-st.sidebar.caption(
-    f"Valid IDs: {user_item_matrix.index.min()} to {user_item_matrix.index.max()}"
+st.sidebar.markdown(f"**Valid User IDs:** {min_id} → {max_id}")
+
+user_id = st.sidebar.number_input(
+    "Enter User ID (try outside range for new user)",
+    value=min_id,
+    step=1
 )
 
 n = st.sidebar.slider("Number of Recommendations", 1, 10, 5)
